@@ -96,7 +96,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cloud_username=entry.data[CONF_CLOUD_USERNAME],
         cloud_password=entry.data[CONF_CLOUD_PASSWORD],
         lock_name=entry.data[CONF_NAME],
-        ssl_verify=False,
         websession=session,
         logger=_LOGGER,
         terminal_uuid=entry.data.get("terminal_uuid"),

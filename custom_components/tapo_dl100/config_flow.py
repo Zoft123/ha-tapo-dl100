@@ -49,7 +49,6 @@ class TapoDl100ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     cloud_username=user_input[CONF_CLOUD_USERNAME],
                     cloud_password=user_input[CONF_CLOUD_PASSWORD],
                     lock_name=user_input[CONF_NAME],
-                    ssl_verify=False,
                     websession=session,
                     logger=_LOGGER,
                 )
@@ -101,7 +100,6 @@ class TapoDl100OptionsFlow(config_entries.OptionsFlow):
                     cloud_username=user_input[CONF_CLOUD_USERNAME],
                     cloud_password=user_input[CONF_CLOUD_PASSWORD],
                     lock_name=user_input[CONF_NAME],
-                    ssl_verify=False,
                     websession=session,
                     logger=_LOGGER,
                     terminal_uuid=self._config_entry.data.get("terminal_uuid"),

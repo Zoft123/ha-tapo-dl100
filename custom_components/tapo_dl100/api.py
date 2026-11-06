@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
+import ssl
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import aiohttp
 from Crypto.Cipher import AES
-
 
 Json = dict[str, Any]
 
@@ -25,6 +28,20 @@ class DlklapError(Exception):
 
 class DlklapAuthError(DlklapError):
     """Authentication error."""
+
+
+class DlklapIntegrityError(DlklapError):
+    """An invalid authenticated response; never retry an uncertain operation."""
+
+
+@lru_cache(maxsize=1)
+def _control_key_ssl_context() -> ssl.SSLContext:
+    """Use verified TLS with the app's private CA for control-key requests only."""
+    context = ssl.create_default_context()
+    context.load_verify_locations(
+        cafile=str(Path(__file__).with_name("certs") / "tp-link-root-ca.pem")
+    )
+    return context
 
 
 def _sha(*parts: bytes) -> bytes:
@@ -40,7 +57,12 @@ def _pkcs7_pad(data: bytes) -> bytes:
 
 
 def _pkcs7_unpad(data: bytes) -> bytes:
-    return data[: -data[-1]]
+    if not data or len(data) % 16:
+        raise DlklapIntegrityError("Invalid DLKLAP padded payload length")
+    pad = data[-1]
+    if not 1 <= pad <= 16 or data[-pad:] != bytes([pad]) * pad:
+        raise DlklapIntegrityError("Invalid DLKLAP response padding")
+    return data[:-pad]
 
 
 def _aes_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
@@ -136,7 +158,14 @@ class _Session:
         )
         if status != 200:
             raise DlklapError(f"/app/request HTTP {status} (seq={self._seq})")
-        decrypted = _pkcs7_unpad(_aes_decrypt(self._lsk, iv, raw[32:]))
+        # Authenticate before decryption, as DoorLockKLAPTransport does in the app.
+        if len(raw) < 48 or (len(raw) - 32) % 16:
+            raise DlklapIntegrityError("Invalid DLKLAP response length")
+        response_mac, response_ciphertext = raw[:32], raw[32:]
+        expected_mac = _sha(self._ldk, seqb, response_ciphertext)
+        if not hmac.compare_digest(response_mac, expected_mac):
+            raise DlklapIntegrityError("DLKLAP response authentication failed")
+        decrypted = _pkcs7_unpad(_aes_decrypt(self._lsk, iv, response_ciphertext))
         return _extract_json(decrypted)
 
 
@@ -145,11 +174,14 @@ async def _post(
     url: str,
     headers: dict[str, str],
     body: bytes | str,
-    ssl: bool | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[int, aiohttp.typedefs.LooseHeaders, bytes]:
-    kwargs: dict[str, Any] = {"headers": headers, "data": body}
-    if ssl is not None:
-        kwargs["ssl"] = ssl
+    kwargs: dict[str, Any] = {
+        "headers": headers,
+        "data": body,
+        "ssl": ssl_context if ssl_context is not None else True,
+        "allow_redirects": False,
+    }
     async with websession.post(url, **kwargs) as response:
         return response.status, response.headers, await response.read()
 
@@ -163,7 +195,6 @@ class DlklapApi:
         cloud_username: str,
         cloud_password: str,
         lock_name: str,
-        ssl_verify: bool,
         websession: aiohttp.ClientSession,
         logger: logging.Logger,
         terminal_uuid: str | None = None,
@@ -173,7 +204,6 @@ class DlklapApi:
         self.cloud_username = cloud_username
         self.cloud_password = cloud_password
         self.lock_name = lock_name
-        self.ssl_verify = ssl_verify
         self.websession = websession
         self.log = logger
 
@@ -298,9 +328,14 @@ class DlklapApi:
                     result = await fn(self._session)
                     self.last_connect_error = None
                     self.last_success_at = (
-                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                        datetime.now(UTC).isoformat().replace("+00:00", "Z")
                     )
                     return result
+                except DlklapIntegrityError as err:
+                    # The operation might already have reached the bolt. Do not resend it.
+                    self._session = None
+                    self.last_connect_error = str(err)
+                    raise
                 except Exception as err:  # noqa: BLE001
                     last_err = err
                     self.last_connect_error = str(err)
@@ -332,7 +367,6 @@ class DlklapApi:
             f"https://wap.tplinkcloud.com/?token={self._token}",
             headers={"Content-Type": "application/json"},
             body=json.dumps({"method": "getDeviceList"}),
-            ssl=self.ssl_verify,
         )
         if status != 200:
             raise DlklapError(f"getDeviceList HTTP {status}")
@@ -396,7 +430,6 @@ class DlklapApi:
             "https://wap.tplinkcloud.com/",
             headers={"Content-Type": "application/json"},
             body=json.dumps(body),
-            ssl=self.ssl_verify,
         )
         if status != 200:
             raise DlklapAuthError(f"login HTTP {status}")
@@ -448,7 +481,7 @@ class DlklapApi:
                 body=json.dumps(
                     {"secret": secret, "random": random4.hex().upper()}
                 ),
-                ssl=self.ssl_verify,
+                ssl_context=await asyncio.to_thread(_control_key_ssl_context),
             )
             if ck_status != 200:
                 raise DlklapError(f"control-key HTTP {ck_status}")
@@ -500,7 +533,7 @@ class DlklapApi:
         remote_random = hs1_raw[:16]
         server_proof = hs1_raw[16:48]
         expected_proof = _sha(local_random + remote_random + lmk)
-        if expected_proof != server_proof:
+        if len(hs1_raw) != 48 or not hmac.compare_digest(expected_proof, server_proof):
             raise DlklapError("handshake1 server proof mismatch")
 
         hs2_status, _, _ = await _post(
